@@ -2,7 +2,7 @@
 """What Testcontainers (docker-java, .NET, Go) needs of the engine API, asked
 the way those clients ask: raw HTTP/1.1 on one kept-alive connection.
 
-    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec ...]
+    tests/testcontainers-api.py SOCKET [version|cmd|keepalive|follow|follow-created|timestamps|exec|endpoints ...]
 
 Prints one line per check, "ok <name>" or "FAIL <name>: why", and exits 1 if
 any failed. The containers it makes (tc-api-*) are left running.
@@ -256,10 +256,34 @@ def check_exec():
     return "200 without Upgrade, ExitCode set at EOF; 101 with it"
 
 
+def check_endpoints():
+    # Testcontainers for .NET sends NetworkMode "" and names the network only in
+    # NetworkingConfig.EndpointsConfig. Docker joins that network and not
+    # bridge, so its embedded DNS answers the aliases (#407).
+    c = Conn()
+    for name in ("tc-api-net-web", "tc-api-net-client"):
+        c.request("DELETE", f"/containers/{name}?force=1")
+    c.request("DELETE", "/networks/tc-api-net")
+    status, _, data = c.request("POST", "/networks/create", {"Name": "tc-api-net"})
+    assert status == 201, f"network create {status} {data[:200]!r}"
+    ids = {}
+    for name, alias in (("tc-api-net-web", "tc-web"), ("tc-api-net-client", "tc-client")):
+        endpoints = {"tc-api-net": {"Aliases": [alias]}}
+        ids[name] = fresh(c, name, ["sleep", "600"], HostConfig={"NetworkMode": ""}, NetworkingConfig={"EndpointsConfig": endpoints})
+        status, _, data = c.request("POST", f"/containers/{ids[name]}/start")
+        assert status == 204, f"start {status} {data[:200]!r}"
+    _, _, d = c.request("GET", f"/containers/{ids['tc-api-net-client']}/json")
+    networks = sorted(json.loads(d)["NetworkSettings"]["Networks"])
+    assert networks == ["tc-api-net"], f"networks {networks}, want only tc-api-net"
+    _, status, _, out = exec_start(Conn(), ids["tc-api-net-client"], ["getent", "hosts", "tc-web"])
+    assert status == 200 and re.search(rb"\d+\.\d+\.\d+\.\d+\s+tc-web", out), f"the alias did not resolve: {out!r}"
+    return "joins only the network named in EndpointsConfig, and its alias resolves"
+
+
 CHECKS = {
     "version": check_version, "cmd": check_cmd, "keepalive": check_keepalive,
     "follow": check_follow, "follow-created": check_follow_created, "timestamps": check_timestamps,
-    "exec": check_exec,
+    "exec": check_exec, "endpoints": check_endpoints,
 }
 
 if __name__ == "__main__":
