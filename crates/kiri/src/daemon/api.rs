@@ -1395,10 +1395,12 @@ fn console_size(v: &Value) -> Option<(u16, u16)> {
 /// A create's Entrypoint and Cmd with the image's, by Docker's rules: a
 /// non-empty Entrypoint drops the image's Cmd; otherwise an empty or missing
 /// Cmd takes the image's (Testcontainers sends `"Cmd": []`), and a missing
-/// Entrypoint the image's (`[]` clears it).
+/// Entrypoint the image's (`[]` clears it). `[""]`, which is what
+/// `--entrypoint=` sends, clears it too, but the image's Cmd stays unused.
 fn command(entry: Option<Vec<String>>, cmd: Option<Vec<String>>, image_entry: &[String], image_cmd: &[String]) -> (Vec<String>, Vec<String>) {
     let cmd = cmd.unwrap_or_default();
     match entry {
+        Some(e) if e.len() == 1 && e[0].is_empty() => (vec![], cmd),
         Some(e) if !e.is_empty() => (e, cmd),
         e => (e.unwrap_or_else(|| image_entry.to_vec()), if cmd.is_empty() { image_cmd.to_vec() } else { cmd }),
     }
@@ -1593,6 +1595,12 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     }
     // The image's own config, for what Kiri's image model does not keep.
     let image_cfg: Value = engine.store.read_config(&image.config_digest).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd);
+    // As in Docker: a create with nothing to run is refused here, not at start,
+    // where `docker run --rm` would wait for a removal that never comes.
+    if entrypoint.is_empty() && cmd.is_empty() {
+        return Err(Error::BadRequest("No command specified".into()));
+    }
     // Checked before mounts, which may create volumes.
     let healthcheck = healthcheck_from(&body, &image_cfg)?;
     let mounts = mounts(&body, engine, &image)?;
@@ -1600,7 +1608,6 @@ pub(super) fn create(req: &Request, engine: &Engine) -> Result<Value, Error> {
     if !ports.is_empty() && network_mode == "none" {
         return Err(Error::BadRequest("a container with --network none cannot publish ports".into()));
     }
-    let (entrypoint, cmd) = command(strings(&body["Entrypoint"]), strings(&body["Cmd"]), &image.config.entrypoint, &image.config.cmd);
     let mut env = image.config.env.clone();
     // Settings → Network → "Pass to containers": the proxy, unless set here.
     let given = strings(&body["Env"]).unwrap_or_default();
@@ -2815,6 +2822,13 @@ mod tests {
         assert_eq!(command(Some(s(&["sh"])), Some(s(&["-c", "x"])), &ie, &ic), (s(&["sh"]), s(&["-c", "x"])));
         // "Entrypoint": [] clears the image's and keeps its Cmd.
         assert_eq!(command(Some(vec![]), None, &ie, &ic), (vec![], ic.clone()));
+        // "Entrypoint": [""] (`--entrypoint=`) clears the image's and does not take its Cmd.
+        assert_eq!(command(Some(s(&[""])), Some(s(&["sh", "-c", "x"])), &ie, &ic), (vec![], s(&["sh", "-c", "x"])));
+        assert_eq!(command(strings(&json!([""])), None, &ie, &ic), (vec![], vec![]));
+        // Only exactly [""] is the reset.
+        assert_eq!(command(Some(s(&["", "x"])), None, &ie, &ic), (s(&["", "x"]), vec![]));
+        // The string form means the same as the one-element array.
+        assert_eq!(command(strings(&json!("")), Some(s(&["sh", "-c", "x"])), &ie, &ic), (vec![], s(&["sh", "-c", "x"])));
     }
 
     #[test]
