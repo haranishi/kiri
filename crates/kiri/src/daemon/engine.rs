@@ -4705,12 +4705,24 @@ fn net_opts(spec: &Spec, joined: Option<&str>, domainname: &str) -> Vec<String> 
     if !spec.mac_address.is_empty() {
         opts.push(format!("{}={}", k::MAC, spec.mac_address));
     }
-    // Docker uses the first three `--dns` servers (and a resolver reads no
-    // more than three): the rest are left out, as it does.
-    if spec.dns.len() > MAX_DNS_SERVERS {
-        crate::diag::warn!("more than three --dns servers: only the first three are used", given = spec.dns.len());
+    // The embedded DNS asks the first three IPv4 `--dns` servers, as Docker
+    // does: later IPv4 ones are left out. IPv6 ones (for resolv.conf, which
+    // the embedded DNS doesn't ask) don't take an IPv4 server's place.
+    let is_v4 = |d: &&String| d.parse::<std::net::Ipv4Addr>().is_ok();
+    let v4 = spec.dns.iter().filter(is_v4).count();
+    if v4 > MAX_DNS_SERVERS {
+        crate::diag::warn!("more than three IPv4 --dns servers: only the first three are used", given = v4);
     }
-    opts.extend(spec.dns.iter().take(MAX_DNS_SERVERS).map(|d| format!("{}={d}", k::NAMESERVER)));
+    let mut kept = 0;
+    for d in &spec.dns {
+        if is_v4(&d) {
+            if kept == MAX_DNS_SERVERS {
+                continue;
+            }
+            kept += 1;
+        }
+        opts.push(format!("{}={d}", k::NAMESERVER));
+    }
     opts.extend(spec.dns_search.iter().map(|d| format!("{}={d}", k::SEARCH)));
     opts.extend(spec.dns_options.iter().map(|d| format!("{}={d}", k::OPTION)));
     if !domainname.is_empty() {
@@ -5936,6 +5948,29 @@ mod net_opts_tests {
         }))
         .unwrap();
         assert!(super::net_opts(&old, None, "").is_empty());
+    }
+
+    /// The cap on `--dns` servers counts IPv4 ones: IPv6 servers ahead of
+    /// them don't push an IPv4 server out, and a fourth IPv4 one is left out.
+    #[test]
+    fn the_first_three_ipv4_dns_servers_are_kept() {
+        let spec: super::Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "dns": ["2001:db8::1", "2001:db8::2", "2001:db8::3", "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"],
+        }))
+        .unwrap();
+        assert_eq!(
+            super::net_opts(&spec, None, ""),
+            [
+                "nameserver=2001:db8::1",
+                "nameserver=2001:db8::2",
+                "nameserver=2001:db8::3",
+                "nameserver=10.0.0.1",
+                "nameserver=10.0.0.2",
+                "nameserver=10.0.0.3"
+            ]
+        );
     }
 }
 
