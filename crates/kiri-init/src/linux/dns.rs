@@ -748,13 +748,17 @@ impl Dns {
                     // Swept by the next lookup (or `on_timer`), no wake-up for it.
                     return None;
                 };
-                // Rounded up: a wake-up a fraction of a millisecond early
-                // would find nothing due and poll again at once.
-                Some(due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
+                Some(wait_ms(due))
             })
             .min()
             .unwrap_or(-1)
     }
+}
+
+/// A wait in whole milliseconds, rounded up: a wake-up a fraction of a
+/// millisecond early would find nothing due and poll again at once.
+fn wait_ms(due: Duration) -> i32 {
+    due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
 }
 
 /// An error a connected UDP socket reports when the way to the server is
@@ -1416,21 +1420,12 @@ mod tests {
     /// a 1 ms wait, not a 0 that polls again at once until it is due.
     #[test]
     fn a_wait_under_a_millisecond_is_one_millisecond() {
-        let owner = [10, 5, 0, 2];
-        let mut dns = Dns::default();
-        dns.set_upstream(owner, vec![[127, 0, 0, 1]]);
-        let mut p = pending();
-        p.key = owner;
-        p.own = Some(0);
-        // Due in a little under 1 ms (or later, on a slow run).
-        p.sent = Instant::now() - super::OWN_WAIT + std::time::Duration::from_micros(900);
-        p.started = Instant::now() + super::OWN_WAIT;
-        dns.pending.push(p);
-        let t = dns.timeout_ms();
-        let due = dns.pending[0].sent + super::OWN_WAIT;
-        if due > Instant::now() {
-            assert!(t >= 1, "{t}");
-        }
+        use std::time::Duration;
+        assert_eq!(super::wait_ms(Duration::ZERO), 0);
+        assert_eq!(super::wait_ms(Duration::from_nanos(1)), 1);
+        assert_eq!(super::wait_ms(Duration::from_micros(999)), 1);
+        assert_eq!(super::wait_ms(Duration::from_millis(1)), 1);
+        assert_eq!(super::wait_ms(Duration::from_millis(1) + Duration::from_nanos(1)), 2);
     }
 
     /// A query past its deadline is answered SERVFAIL when the next query

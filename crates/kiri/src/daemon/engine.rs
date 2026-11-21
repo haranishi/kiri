@@ -4707,20 +4707,21 @@ fn net_opts(spec: &Spec, joined: Option<&str>, domainname: &str) -> Vec<String> 
     }
     // The embedded DNS asks the first three IPv4 `--dns` servers, as Docker
     // does: later IPv4 ones are left out. IPv6 ones (for resolv.conf, which
-    // the embedded DNS doesn't ask) don't take an IPv4 server's place.
+    // the embedded DNS doesn't ask) don't take an IPv4 server's place, and
+    // are bounded to three as well.
     let is_v4 = |d: &&String| d.parse::<std::net::Ipv4Addr>().is_ok();
     let v4 = spec.dns.iter().filter(is_v4).count();
-    if v4 > MAX_DNS_SERVERS {
-        crate::diag::warn!("more than three IPv4 --dns servers: only the first three are used", given = v4);
+    let other = spec.dns.len() - v4;
+    if v4 > MAX_DNS_SERVERS || other > MAX_DNS_SERVERS {
+        crate::diag::warn!("more than three IPv4 or other --dns servers: only the first three of each are used", given = spec.dns.len());
     }
-    let mut kept = 0;
+    let (mut kept4, mut kept_other) = (0, 0);
     for d in &spec.dns {
-        if is_v4(&d) {
-            if kept == MAX_DNS_SERVERS {
-                continue;
-            }
-            kept += 1;
+        let kept = if is_v4(&d) { &mut kept4 } else { &mut kept_other };
+        if *kept == MAX_DNS_SERVERS {
+            continue;
         }
+        *kept += 1;
         opts.push(format!("{}={d}", k::NAMESERVER));
     }
     opts.extend(spec.dns_search.iter().map(|d| format!("{}={d}", k::SEARCH)));
@@ -5970,6 +5971,21 @@ mod net_opts_tests {
                 "nameserver=10.0.0.2",
                 "nameserver=10.0.0.3"
             ]
+        );
+    }
+
+    /// IPv6 `--dns` entries are bounded to three as well.
+    #[test]
+    fn at_most_three_ipv6_dns_servers_are_kept() {
+        let spec: super::Spec = serde_json::from_value(serde_json::json!({
+            "image": "alpine", "image_id": "sha256:x", "entrypoint": [], "cmd": ["sh"], "env": [], "cwd": "", "user": "",
+            "auto_remove": false, "network_mode": "bridge", "labels": {},
+            "dns": ["2001:db8::1", "2001:db8::2", "2001:db8::3", "2001:db8::4", "10.0.0.1"],
+        }))
+        .unwrap();
+        assert_eq!(
+            super::net_opts(&spec, None, ""),
+            ["nameserver=2001:db8::1", "nameserver=2001:db8::2", "nameserver=2001:db8::3", "nameserver=10.0.0.1"]
         );
     }
 }
