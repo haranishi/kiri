@@ -713,6 +713,11 @@ t dns-options "options ndots:2" $D run --rm --dns-option ndots:2 alpine cat /etc
 t dns-user-net "nameserver 127.0.0.11" $D run --rm --network ipamnet --dns 9.9.9.9 alpine cat /etc/resolv.conf
 t dns-user-net-forwards "Address" $D run --rm --network ipamnet --dns 9.9.9.9 alpine nslookup example.com
 t dns-user-net-names "10.231.0.10" $D run --rm --network ipamnet --dns 9.9.9.9 alpine nslookup fixed
+# Several --dns servers on a user network: one that refuses (nothing listens
+# on the container's 127.0.0.1:53) or never answers (192.0.2.1) hands the
+# lookup to the next, as on the default bridge and with Docker (#455).
+t dns-user-net-next-after-refusal "example.com" $D run --rm --network ipamnet --dns 127.0.0.1 --dns 9.9.9.9 alpine getent hosts example.com
+t dns-user-net-next-after-silence "example.com" $D run --rm --network ipamnet --dns 192.0.2.1 --dns 9.9.9.9 alpine getent hosts example.com
 t dns-inspect "[9.9.9.9]" bash -c "$D create --name dnsc --dns 9.9.9.9 alpine true >/dev/null; $D inspect -f '{{.HostConfig.Dns}}' dnsc; $D rm dnsc >/dev/null"
 t domainname "web.example.com" $D run --rm -h web --domainname example.com alpine sh -c 'hostname -f 2>/dev/null || cat /etc/hosts'
 t domainname-uts "example.com" $D run --rm --domainname example.com alpine cat /proc/sys/kernel/domainname

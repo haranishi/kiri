@@ -16,8 +16,10 @@
 //! leaves unanswered for `FALLBACK_AFTER`, is asked again through the Kiri
 //! daemon on the Mac, over vsock, which asks the Mac's own resolvers
 //! (crates/kiri/src/daemon/dns.rs). A container's own `--dns` servers are
-//! tried in the order given when one refuses or can't be sent to, and are
-//! never second-guessed by the VM's resolver or the host.
+//! tried in the order given, as Docker's embedded DNS does: the next one
+//! when one refuses (nothing listens, or it answers REFUSED or SERVFAIL),
+//! can't be sent to, or leaves the query unanswered for `FALLBACK_AFTER`.
+//! They are never second-guessed by the VM's resolver or the host.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -53,8 +55,9 @@ const RELAY_CONNECT: Duration = Duration::from_millis(250);
 /// each would stall the loop for `RELAY_CONNECT` again.
 const RELAY_BACKOFF: Duration = Duration::from_secs(5);
 /// A lookup the VM's resolver hasn't answered within this goes through the
-/// host (VM only). Gateway answers take milliseconds; a slow recursive one
-/// that loses the race is simply replaced by the host's.
+/// host (VM only), and one a container's own `--dns` server hasn't goes to
+/// its next one. Gateway answers take milliseconds; a slow recursive one
+/// that loses the race is simply replaced by the host's or the next one's.
 const FALLBACK_AFTER: Duration = Duration::from_secs(1);
 /// Largest reply the host relay may send (a DNS over TCP frame's limit).
 const MAX_RELAYED: usize = 2 + 65_535;
@@ -360,11 +363,7 @@ impl Dns {
                 if n < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ECONNREFUSED) {
                     // Nothing listens: try the next server, or the host
                     // if this query may go through it.
-                    let p = &mut self.pending[at];
-                    if let Some(sock) = ask_next(&mut p.remaining, &p.query) {
-                        p.sock = sock;
-                        p.sent = Instant::now();
-                    } else {
+                    if !self.ask_next_own(at) {
                         self.relay(at);
                     }
                     break;
@@ -375,6 +374,11 @@ impl Dns {
                 let msg = &mut buf[..n as usize];
                 let p = &self.pending[at];
                 if u16::from_be_bytes([msg[0], msg[1]]) == p.our && response_matches(msg, p) {
+                    // REFUSED or SERVFAIL from one of its own servers: the
+                    // next one, as with Docker. From the last, it goes back.
+                    if matches!(msg[3] & 0x0f, 2 | 5) && self.ask_next_own(at) {
+                        break;
+                    }
                     self.answered(at, msg);
                     break;
                 }
@@ -512,6 +516,21 @@ impl Dns {
         }
     }
 
+    /// Sends pending query `at` to the next of the container's own servers
+    /// that it can be sent to, on a fresh socket (a fresh source port), with
+    /// the same ID. False when none is left.
+    fn ask_next_own(&mut self, at: usize) -> bool {
+        let p = &mut self.pending[at];
+        match ask_next(&mut p.remaining, &p.query) {
+            Some(sock) => {
+                p.sock = sock;
+                p.sent = Instant::now();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Sends pending query `at` again, through the host, once.
     fn relay(&mut self, at: usize) {
         if !self.pending[at].may_relay {
@@ -595,13 +614,20 @@ impl Dns {
     }
 
     /// Sends lookups the VM's resolver has left unanswered too long
-    /// through the host. Called on every turn of the agent's loop.
+    /// through the host, and ones a container's own server has to its next
+    /// one. Called on every turn of the agent's loop.
     pub fn on_timer(&mut self) {
         let now = Instant::now();
         for at in 0..self.pending.len() {
             let p = &self.pending[at];
-            if p.may_relay && now.duration_since(p.sent) >= FALLBACK_AFTER {
+            if now.duration_since(p.sent) < FALLBACK_AFTER {
+                continue;
+            }
+            if p.may_relay {
                 self.relay(at);
+            } else if !p.remaining.is_empty() {
+                // None that can be sent to: the last one may still answer.
+                self.ask_next_own(at);
             }
         }
     }
@@ -611,7 +637,7 @@ impl Dns {
         let now = Instant::now();
         self.pending
             .iter()
-            .filter(|p| p.may_relay)
+            .filter(|p| p.may_relay || !p.remaining.is_empty())
             .map(|p| FALLBACK_AFTER.saturating_sub(now.duration_since(p.sent)).as_millis().min(i32::MAX as u128) as i32)
             .min()
             .unwrap_or(-1)
@@ -901,14 +927,13 @@ mod tests {
             a.sin_port
         };
         let resolver_ip = [127, 0, 0, 5];
-        let resolver = UdpSocket::from(super::bound(resolver_ip).unwrap());
+        let resolver = UdpSocket::from(super::bound(resolver_ip, 53).unwrap());
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_nonblocking(true).unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
         let from = super::sockaddr(addr.ip().octets(), addr.port());
         // One server still works; refusals move through the list in order.
         for servers in [vec![resolver_ip], vec![[127, 0, 0, 4], resolver_ip], vec![[127, 0, 0, 4], [127, 0, 0, 6], resolver_ip]] {
-            let attempts = servers.len();
             let owner = [10, 5, 0, 2];
             let mut dns = Dns { relay: true, ..Default::default() };
             dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
@@ -918,7 +943,7 @@ mod tests {
             assert_eq!(dns.pending.len(), 1);
             assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), servers[0], "the first server is asked first");
             let sent_query = dns.pending[0].query.clone();
-            for next in 1..attempts {
+            for &next in &servers[1..] {
                 let fd = dns.pending[0].sock.as_raw_fd();
                 let old_port = port(fd);
                 dns.pending[0].sent = Instant::now() - super::FORWARD_TIMEOUT;
@@ -931,7 +956,7 @@ mod tests {
                 assert_ne!(port(p.sock.as_raw_fd()), old_port, "a fresh source port");
                 assert!(p.sent >= retrying, "a fresh retry survives the sweep");
                 assert_eq!(p.query, sent_query, "the same query and our ID");
-                assert_eq!(peer(p.sock.as_raw_fd()), servers[next], "servers are tried in the order given");
+                assert_eq!(peer(p.sock.as_raw_fd()), next, "servers are tried in the order given");
             }
             let mut buf = [0u8; 512];
             wait_readable(resolver.as_raw_fd());
@@ -960,7 +985,7 @@ mod tests {
         // `ask` gives up on it at once.
         let unsendable = [255, 255, 255, 255];
         let resolver_ip = [127, 0, 0, 10];
-        let resolver = UdpSocket::from(super::bound(resolver_ip).unwrap());
+        let resolver = UdpSocket::from(super::bound(resolver_ip, 53).unwrap());
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
         let from = super::sockaddr(addr.ip().octets(), addr.port());
@@ -984,13 +1009,100 @@ mod tests {
         assert!(dns.relay_down_until.is_none(), "no host relay was tried");
     }
 
+    /// REFUSED or SERVFAIL from one of a container's own servers sends the
+    /// query to its next one, as Docker's embedded DNS does; from the last
+    /// one, that answer goes back to the client.
+    #[test]
+    fn an_own_server_that_answers_refused_hands_over_to_the_next() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        let (first_ip, second_ip) = ([127, 0, 0, 20], [127, 0, 0, 21]);
+        let first = UdpSocket::from(super::bound(first_ip, 53).unwrap());
+        let second = UdpSocket::from(super::bound(second_ip, 53).unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        let from = super::sockaddr(addr.ip().octets(), addr.port());
+        let owner = [10, 5, 0, 2];
+        // Answers the query waiting at `server` with `rcode`.
+        let reply = |server: &UdpSocket, rcode: u8| {
+            let mut buf = [0u8; 512];
+            wait_readable(server.as_raw_fd());
+            let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let mut r = buf[..n].to_vec();
+            r[2] |= 0x80;
+            r[3] = (r[3] & 0xf0) | rcode;
+            server.send_to(&r, peer).unwrap();
+        };
+        for (rcode, servers, answered_by) in [(5u8, vec![first_ip, second_ip], 1usize), (2, vec![first_ip, second_ip], 1), (5, vec![first_ip], 0)] {
+            let mut dns = Dns { relay: true, ..Default::default() };
+            dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+            dns.set_upstream(owner, servers.clone());
+            let q = query("example.com", 1);
+            dns.forward(0, &q, from, &[]);
+            reply(&first, rcode);
+            let fd = dns.pending[0].sock.as_raw_fd();
+            wait_readable(fd);
+            dns.on_readable(fd, &[]);
+            let mut buf = [0u8; 512];
+            if answered_by == 1 {
+                assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), second_ip, "rcode {rcode}: the next server");
+                reply(&second, 0);
+                let fd = dns.pending[0].sock.as_raw_fd();
+                wait_readable(fd);
+                dns.on_readable(fd, &[]);
+                assert!(dns.pending.is_empty());
+                wait_readable(client.as_raw_fd());
+                let n = client.recv(&mut buf).unwrap();
+                assert_eq!((&buf[..2], buf[3] & 0x0f, n), (&q[..2], 0, q.len()), "the next server's answer, with the client's ID");
+            } else {
+                assert!(dns.pending.is_empty(), "the last server's answer goes back");
+                wait_readable(client.as_raw_fd());
+                client.recv(&mut buf).unwrap();
+                assert_eq!((&buf[..2], buf[3] & 0x0f), (&q[..2], rcode));
+            }
+            assert!(dns.relay_down_until.is_none(), "no host relay was tried");
+        }
+    }
+
+    /// A container's own server that leaves a query unanswered for
+    /// `FALLBACK_AFTER` hands it to the next one; never to the VM or host.
+    #[test]
+    fn a_silent_own_server_hands_over_after_the_wait() {
+        use std::net::UdpSocket;
+        use std::os::fd::AsRawFd;
+        let (silent_ip, next_ip) = ([127, 0, 0, 22], [127, 0, 0, 23]);
+        let _silent = UdpSocket::from(super::bound(silent_ip, 53).unwrap());
+        let next = UdpSocket::from(super::bound(next_ip, 53).unwrap());
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
+        let owner = [10, 5, 0, 2];
+        let mut dns = Dns { relay: true, ..Default::default() };
+        dns.servers.push(Server { bridges: vec!["kiri1".into()], sock: udp_socket().unwrap(), container: Some((42, owner)) });
+        dns.set_upstream(owner, vec![silent_ip, next_ip]);
+        dns.forward(0, &query("example.com", 1), super::sockaddr(addr.ip().octets(), addr.port()), &[]);
+        assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), silent_ip);
+        let t = dns.timeout_ms();
+        assert!((0..=1000).contains(&t), "{t}");
+        dns.on_timer();
+        assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), silent_ip, "not before the wait");
+        dns.pending[0].sent = Instant::now() - super::FALLBACK_AFTER;
+        dns.on_timer();
+        assert_eq!(peer(dns.pending[0].sock.as_raw_fd()), next_ip, "the next server after the wait");
+        let mut buf = [0u8; 512];
+        wait_readable(next.as_raw_fd());
+        let (n, _) = next.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &dns.pending[0].query[..], "the same query and our ID");
+        assert_eq!(dns.timeout_ms(), -1, "nothing left to hand over to");
+        assert!(!dns.pending[0].may_relay && dns.relay_down_until.is_none(), "never the host");
+    }
+
     #[test]
     fn exhausted_own_servers_never_use_the_vm_or_host() {
         use std::io::ErrorKind;
         use std::net::UdpSocket;
         use std::os::fd::AsRawFd;
         let vm_ip = [127, 0, 0, 9];
-        let vm = UdpSocket::from(super::bound(vm_ip).unwrap());
+        let vm = UdpSocket::from(super::bound(vm_ip, 53).unwrap());
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client.set_nonblocking(true).unwrap();
         let std::net::SocketAddr::V4(addr) = client.local_addr().unwrap() else { panic!() };
