@@ -720,9 +720,11 @@ t dns-user-net-names "10.231.0.10" $D run --rm --network ipamnet --dns 9.9.9.9 a
 # every host, where 127.0.0.1 may well have a resolver of its own.
 t dns-user-net-next-after-refusal "example.com" $D run --rm --network ipamnet --dns 10.231.0.10 --dns 9.9.9.9 alpine getent hosts example.com
 t dns-user-net-next-after-silence "example.com" $D run --rm --network ipamnet --dns 192.0.2.1 --dns 9.9.9.9 alpine getent hosts example.com
-# When every server refuses the answer is a failure at once, not a wait for
-# the client to give up (Docker answers SERVFAIL).
-t dns-user-net-all-refused-fails-at-once "fast" $D run --rm --network ipamnet --dns 10.231.0.10 alpine sh -c 's=$(date +%s); getent hosts example.com >/dev/null; [ $(( $(date +%s) - s )) -le 2 ] && echo fast || echo slow'
+# When every server refuses the answer is SERVFAIL at once, not a wait for
+# the client to give up (as with Docker). Asked with nslookup, which prints
+# the answer it gets: musl's getent never takes SERVFAIL as final and waits
+# out its own timeout whatever the server says.
+t dns-user-net-all-refused-fails-at-once "SERVFAIL fast" $D run --rm --network ipamnet --dns 10.231.0.10 alpine sh -c 's=$(date +%s); case "$(nslookup -type=a example.com 2>&1)" in *SERVFAIL*) a=SERVFAIL ;; *) a=other ;; esac; [ $(( $(date +%s) - s )) -le 2 ] && echo "$a fast" || echo "$a slow"'
 # Only the first three --dns servers are used, as with Docker.
 t dns-user-net-fourth-server-unused "none" $D run --rm --network ipamnet --dns 10.231.0.10 --dns 10.231.0.10 --dns 10.231.0.10 --dns 9.9.9.9 alpine sh -c 'getent hosts example.com >/dev/null && echo answered || echo none'
 t dns-inspect "[9.9.9.9]" bash -c "$D create --name dnsc --dns 9.9.9.9 alpine true >/dev/null; $D inspect -f '{{.HostConfig.Dns}}' dnsc; $D rm dnsc >/dev/null"
