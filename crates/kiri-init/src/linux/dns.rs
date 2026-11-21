@@ -58,9 +58,9 @@ const RELAY_CONNECT: Duration = Duration::from_millis(250);
 /// each would stall the loop for `RELAY_CONNECT` again.
 const RELAY_BACKOFF: Duration = Duration::from_secs(5);
 /// A lookup the VM's resolver hasn't answered within this goes through the
-/// host (VM only), and one a container's own `--dns` server hasn't goes to
-/// its next one. Gateway answers take milliseconds; a slow recursive one
-/// that loses the race is simply replaced by the host's or the next one's.
+/// host (VM only). Gateway answers take milliseconds; a slow recursive one
+/// that loses the race is simply replaced by the host's. (A container's own
+/// `--dns` server has `OWN_WAIT` before its next one is asked.)
 const FALLBACK_AFTER: Duration = Duration::from_secs(1);
 /// Docker's limit: it uses the first three `--dns` servers and no more.
 pub const MAX_OWN_SERVERS: usize = 3;
@@ -510,7 +510,7 @@ impl Dns {
             // None of its own can be sent to: SERVFAIL, not silence.
             None if own.is_some() => {
                 if let Some(s) = self.servers.get(server) {
-                    send_to(s.sock.as_raw_fd(), &servfail(id, &q[12..end]), &client);
+                    send_to(s.sock.as_raw_fd(), &servfail(id, rd(q), &q[12..end]), &client);
                 }
                 return;
             }
@@ -584,7 +584,7 @@ impl Dns {
     fn fail(&mut self, at: usize) {
         let p = self.pending.swap_remove(at);
         if let Some(s) = self.servers.iter().find(|s| s.sock.as_raw_fd() == p.server) {
-            let reply = servfail(p.id, &p.question);
+            let reply = servfail(p.id, rd(&p.query), &p.question);
             send_to(s.sock.as_raw_fd(), &reply, &p.client);
         }
     }
@@ -710,7 +710,9 @@ impl Dns {
                     // Swept by the next lookup (or `on_timer`), no wake-up for it.
                     return None;
                 };
-                Some(due.as_millis().min(i32::MAX as u128) as i32)
+                // Rounded up: a wake-up a fraction of a millisecond early
+                // would find nothing due and poll again at once.
+                Some(due.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
             })
             .min()
             .unwrap_or(-1)
@@ -724,11 +726,16 @@ fn is_unreachable(errno: i32) -> bool {
     matches!(errno, libc::ECONNREFUSED | libc::EHOSTUNREACH | libc::ENETUNREACH | libc::EPERM)
 }
 
-/// A SERVFAIL for a query with this `id` and `question` section.
-fn servfail(id: u16, question: &[u8]) -> Vec<u8> {
+/// Whether query `q` asked for recursion (RD), which a reply copies.
+fn rd(q: &[u8]) -> bool {
+    q.get(2).is_some_and(|f| f & 0x01 != 0)
+}
+
+/// A SERVFAIL for a query with this `id`, RD flag and `question` section.
+fn servfail(id: u16, rd: bool, question: &[u8]) -> Vec<u8> {
     let mut r = Vec::with_capacity(12 + question.len());
     r.extend_from_slice(&id.to_be_bytes());
-    r.extend_from_slice(&[0x81, 0x82]); // response, recursion desired + available, SERVFAIL
+    r.extend_from_slice(&[0x80 | u8::from(rd), 0x82]); // response, RD as asked, recursion available, SERVFAIL
     r.extend_from_slice(&1u16.to_be_bytes());
     r.extend_from_slice(&[0; 6]);
     r.extend_from_slice(question);
@@ -1324,6 +1331,38 @@ mod tests {
         assert!(dns.clients.is_empty());
         dns.set_upstream([10, 5, 0, 3], vec![]);
         assert!(dns.clients.is_empty());
+    }
+
+    /// SERVFAIL copies the query's recursion-desired flag.
+    #[test]
+    fn servfail_copies_recursion_desired() {
+        let mut q = query("example.com", 1);
+        assert!(super::rd(&q));
+        assert_eq!(super::servfail(7, super::rd(&q), &q[12..])[2], 0x81);
+        q[2] &= !0x01;
+        assert_eq!(super::servfail(7, super::rd(&q), &q[12..])[2..4], [0x80, 0x82]);
+        assert!(!super::rd(&[]));
+    }
+
+    /// The wait for `poll` is rounded up: a fraction of a millisecond left is
+    /// a 1 ms wait, not a 0 that polls again at once until it is due.
+    #[test]
+    fn a_wait_under_a_millisecond_is_one_millisecond() {
+        let owner = [10, 5, 0, 2];
+        let mut dns = Dns::default();
+        dns.set_upstream(owner, vec![[127, 0, 0, 1]]);
+        let mut p = pending();
+        p.key = owner;
+        p.own = Some(0);
+        // Due in a little under 1 ms (or later, on a slow run).
+        p.sent = Instant::now() - super::OWN_WAIT + std::time::Duration::from_micros(900);
+        p.started = Instant::now() + super::OWN_WAIT;
+        dns.pending.push(p);
+        let t = dns.timeout_ms();
+        let due = dns.pending[0].sent + super::OWN_WAIT;
+        if due > Instant::now() {
+            assert!(t >= 1, "{t}");
+        }
     }
     use std::time::Instant;
 
