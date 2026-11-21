@@ -108,6 +108,7 @@ user-net-own-dns-server	#624	a container on a user network could not bind port 5
 user-net-own-dns-names	#624	a container running its own DNS server must still resolve the network's names
 user-net-own-dns-upstream	#624	a container running its own DNS server must still resolve names outside
 dns-user-net-next-after-refusal	#455	on a user network a --dns server that refused ended the lookup: the next --dns server was never asked
+dns-user-net-all-refused-fails-at-once	#455	when every --dns server of a container on a user network refused, the lookup waited for the client to give up instead of failing
 dns-user-net-next-after-silence	#455	on a user network a --dns server that never answered ended the lookup: the next --dns server was never asked
 top-l	#625	docker top -l was refused or gave the wrong columns
 top-l-values	#625	docker top -l gave wrong values

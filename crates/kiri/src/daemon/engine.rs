@@ -4689,6 +4689,9 @@ impl Engine {
     }
 }
 
+/// The `--dns` servers a container uses, as with Docker.
+const MAX_DNS_SERVERS: usize = 3;
+
 /// A Docker event in Kiri's log: containers and images coming and going,
 /// with name, image and exit code; never labels (they can hold anything).
 /// A BuildKit container's exec is a build session (`docker build`).
@@ -4702,7 +4705,12 @@ fn net_opts(spec: &Spec, joined: Option<&str>, domainname: &str) -> Vec<String> 
     if !spec.mac_address.is_empty() {
         opts.push(format!("{}={}", k::MAC, spec.mac_address));
     }
-    opts.extend(spec.dns.iter().map(|d| format!("{}={d}", k::NAMESERVER)));
+    // Docker uses the first three `--dns` servers (and a resolver reads no
+    // more than three): the rest are left out, as it does.
+    if spec.dns.len() > MAX_DNS_SERVERS {
+        crate::diag::warn!("more than three --dns servers: only the first three are used", given = spec.dns.len());
+    }
+    opts.extend(spec.dns.iter().take(MAX_DNS_SERVERS).map(|d| format!("{}={d}", k::NAMESERVER)));
     opts.extend(spec.dns_search.iter().map(|d| format!("{}={d}", k::SEARCH)));
     opts.extend(spec.dns_options.iter().map(|d| format!("{}={d}", k::OPTION)));
     if !domainname.is_empty() {

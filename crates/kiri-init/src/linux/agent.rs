@@ -231,8 +231,6 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
             }
         }
 
-        dns.on_timer();
-
         // Output and input first, so a process's last words go out before its exit.
         for pfd in &fds[3..] {
             if pfd.revents == 0 {
@@ -361,6 +359,10 @@ fn serve_loop(mut conn: File, paths: &Paths, procs: &mut HashMap<libc::pid_t, Pr
         }
 
         relays.retain(|r| !r.dead);
+
+        // After the replies that arrived with this wake-up were read, so one
+        // that came in just as its wait ran out is not thrown away.
+        dns.on_timer();
 
         if fds[1].revents != 0 {
             drain_signals(&sigfd);
